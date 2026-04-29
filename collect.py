@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import feedparser
+import requests
 import anthropic
 from datetime import datetime
 from pathlib import Path
@@ -13,22 +14,47 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 load_dotenv(override=True)
 
 RSS_FEEDS = {
-    "PR Times": "https://prtimes.jp/index.rdf",
-    "MarkeZine": "https://markezine.jp/rss/new/20/index.xml",
-    "AdverTimes": "https://www.advertimes.com/feed/",
+    "MarkeZine":   "https://markezine.jp/rss/new/20/index.xml",
+    "AdverTimes":  "https://www.advertimes.com/feed/",
+    "DIGIDAY":     "https://digiday.jp/feed/",
+    "ITmedia":     "https://rss.itmedia.co.jp/rss/2.0/marketing.xml",
 }
 
 KEYWORDS = [
     "キャンペーン", "プロモーション", "新発売", "期間限定",
     "コラボ", "タイアップ", "サンプリング", "CM", "広告",
+    "マーケティング", "インフルエンサー", "ブランド", "SNS",
+    "市場", "戦略", "メディア", "デジタル", "リテール",
+]
+
+PAYWALL_SIGNALS = [
+    "会員登録をして続きを読む",
+    "有料記事",
+    "購読が必要",
+    "会員限定",
+    "ログインして続きを読む",
 ]
 
 OUTPUT_FILE = Path("articles.json")
 HTML_FILE   = Path("index.html")
-MODEL = "claude-haiku-4-5-20251001"
+MODEL       = "claude-haiku-4-5-20251001"
+
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
 SYSTEM_PROMPT = """あなたはマーケティング専門家です。
 与えられた記事のタイトルと概要をもとに、以下のJSON形式のみで回答してください。
+説明文や前置きは一切不要です。JSONのみを出力してください。
+
+{
+  "what": "何のキャンペーン・施策か（2文以内）",
+  "why": "なぜこの施策か。企業戦略・業界背景から推測（3〜4文）",
+  "so_what": "マーケターが自分の仕事に使えるインサイト（2〜3文）"
+}"""
+
+WEB_SEARCH_SYSTEM_PROMPT = """あなたはマーケティング専門家です。
+与えられた記事タイトルをWeb検索して関連情報を収集し、以下のJSON形式のみで回答してください。
 説明文や前置きは一切不要です。JSONのみを出力してください。
 
 {
@@ -54,9 +80,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       --text: #1e293b;
       --muted: #64748b;
       --border: #e2e8f0;
-      --tag-pr: #dc2626;
       --tag-mz: #0891b2;
       --tag-at: #059669;
+      --tag-dg: #7c3aed;
+      --tag-it: #ea580c;
       --radius: 12px;
       --shadow: 0 2px 12px rgba(0,0,0,0.08);
     }
@@ -105,7 +132,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     input[type="search"]::placeholder { color: rgba(255,255,255,0.6); }
     input[type="search"] { flex: 1; min-width: 160px; }
-    select { cursor: pointer; min-width: 130px; }
+    select { cursor: pointer; min-width: 140px; }
     select option { background: #1e3a8a; color: white; }
     input[type="search"]:focus, select:focus { background: rgba(255,255,255,0.25); }
 
@@ -117,11 +144,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       white-space: nowrap;
     }
 
-    .updated {
-      font-size: 0.72rem;
-      opacity: 0.6;
-      white-space: nowrap;
-    }
+    .updated { font-size: 0.72rem; opacity: 0.6; white-space: nowrap; }
 
     main { max-width: 1200px; margin: 28px auto; padding: 0 16px; }
 
@@ -145,7 +168,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     .card-header { padding: 16px 18px 12px; border-bottom: 1px solid var(--border); }
 
-    .meta { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .meta { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
 
     .source-tag {
       font-size: 0.7rem;
@@ -156,14 +179,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: white;
     }
 
-    .source-tag.pr-times  { background: var(--tag-pr); }
-    .source-tag.markezine { background: var(--tag-mz); }
+    .source-tag.markezine  { background: var(--tag-mz); }
     .source-tag.advertimes { background: var(--tag-at); }
+    .source-tag.digiday    { background: var(--tag-dg); }
+    .source-tag.itmedia    { background: var(--tag-it); }
+
+    .web-search-badge {
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: #fef9c3;
+      color: #854d0e;
+      border: 1px solid #fde047;
+      white-space: nowrap;
+    }
 
     .date { font-size: 0.75rem; color: var(--muted); }
 
     .card-title { font-size: 0.95rem; font-weight: 600; line-height: 1.5; }
-
     .card-title a { color: inherit; text-decoration: none; transition: color 0.15s; }
     .card-title a:hover { color: var(--primary); }
 
@@ -234,9 +268,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="search" id="search" placeholder="キーワード検索..." />
       <select id="sourceFilter">
         <option value="">すべての情報源</option>
-        <option value="PR Times">PR Times</option>
         <option value="MarkeZine">MarkeZine</option>
         <option value="AdverTimes">AdverTimes</option>
+        <option value="DIGIDAY">DIGIDAY</option>
+        <option value="ITmedia">ITmedia</option>
       </select>
     </div>
     <div class="count-badge" id="countBadge">0 件</div>
@@ -254,10 +289,13 @@ const ARTICLES_DATA = __ARTICLES_JSON__;
 let allArticles = ARTICLES_DATA.map((a, i) => ({ ...a, _id: i }));
 
 function sourceClass(source) {
-  if (source === 'PR Times')  return 'pr-times';
-  if (source === 'MarkeZine') return 'markezine';
-  if (source === 'AdverTimes') return 'advertimes';
-  return '';
+  const map = {
+    'MarkeZine':  'markezine',
+    'AdverTimes': 'advertimes',
+    'DIGIDAY':    'digiday',
+    'ITmedia':    'itmedia',
+  };
+  return map[source] || '';
 }
 
 function formatDate(raw) {
@@ -295,10 +333,15 @@ function createCard(article) {
   }).join('');
 
   const safeTitle = article.title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const webBadge = article.web_searched
+    ? '<span class="web-search-badge">&#128269; Web検索で分析</span>'
+    : '';
+
   card.innerHTML = `
     <div class="card-header">
       <div class="meta">
         <span class="source-tag ${sourceClass(article.source)}">${article.source}</span>
+        ${webBadge}
         <span class="date">${formatDate(article.published)}</span>
       </div>
       <div class="card-title">
@@ -361,6 +404,8 @@ render(allArticles);
 </html>"""
 
 
+# ── データ入出力 ──────────────────────────────────────────────
+
 def load_existing_articles() -> list[dict]:
     if OUTPUT_FILE.exists():
         with open(OUTPUT_FILE, encoding="utf-8") as f:
@@ -384,35 +429,90 @@ def build_html(articles: list[dict]) -> None:
     print(f"index.html を更新しました（{len(articles)} 件埋め込み）")
 
 
+# ── フィルタリング ────────────────────────────────────────────
+
 def matches_keywords(title: str) -> bool:
     return any(kw in title for kw in KEYWORDS)
 
 
-def analyze(client: anthropic.Anthropic, title: str, summary: str, source: str) -> dict:
-    user_message = f"情報源: {source}\nタイトル: {title}\n概要: {summary[:500] if summary else '（概要なし）'}"
+# ── 有料記事の判定 ────────────────────────────────────────────
 
+def is_paywalled(url: str) -> bool:
+    try:
+        r = requests.get(url, headers=FETCH_HEADERS, timeout=8, allow_redirects=True)
+        return any(signal in r.text for signal in PAYWALL_SIGNALS)
+    except Exception:
+        return False
+
+
+# ── AI 分析 ───────────────────────────────────────────────────
+
+def _extract_json(text: str) -> dict:
+    """レスポンステキストから JSON を抽出してパース"""
+    text = text.strip()
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    # JSON ブロックだけ取り出す
+    start = text.find("{")
+    end   = text.rfind("}") + 1
+    if start != -1 and end > start:
+        text = text[start:end]
+    return json.loads(text)
+
+
+def analyze_normal(client: anthropic.Anthropic, title: str, summary: str, source: str) -> dict:
+    """通常記事：RSS 概要テキストで分析"""
+    user_message = (
+        f"情報源: {source}\n"
+        f"タイトル: {title}\n"
+        f"概要: {summary[:500] if summary else '（概要なし）'}"
+    )
     message = client.messages.create(
         model=MODEL,
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
+    return _extract_json(message.content[0].text)
 
-    text = message.content[0].text.strip()
-    if "```" in text:
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text)
 
+def analyze_with_web_search(client: anthropic.Anthropic, title: str, source: str) -> dict:
+    """有料記事：web_search ツールで関連情報を収集して分析"""
+    user_message = (
+        f"「{title}」（情報源: {source}）について検索し、"
+        "マーケティング施策として分析してください。"
+        "検索結果をもとに、指定のJSON形式のみで回答してください。"
+    )
+    response = client.beta.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        system=WEB_SEARCH_SYSTEM_PROMPT,
+        tools=[{
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 3,
+        }],
+        messages=[{"role": "user", "content": user_message}],
+        betas=["web-search-2025-03-05"],
+    )
+    # テキストブロックを後ろから探す（最終回答を取得）
+    for block in reversed(response.content):
+        if hasattr(block, "text") and block.text.strip():
+            return _extract_json(block.text)
+    raise ValueError("web_search 分析でテキスト応答が得られませんでした")
+
+
+# ── メイン収集処理 ────────────────────────────────────────────
 
 def collect() -> None:
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-    existing = load_existing_articles()
+    existing     = load_existing_articles()
     existing_urls = {a["url"] for a in existing}
-    new_articles = []
-    feedparser.USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    new_articles  = []
+    feedparser.USER_AGENT = FETCH_HEADERS["User-Agent"]
 
     for source_name, feed_url in RSS_FEEDS.items():
         print(f"\n[{source_name}] フィード取得中: {feed_url}")
@@ -423,40 +523,48 @@ def collect() -> None:
             continue
 
         for entry in feed.entries:
-            url = getattr(entry, "link", "")
-            title = getattr(entry, "title", "")
-            summary = getattr(entry, "summary", "")
+            url       = getattr(entry, "link", "")
+            title     = getattr(entry, "title", "")
+            summary   = getattr(entry, "summary", "")
             published = getattr(entry, "published", "")
 
             if not url or url in existing_urls:
                 continue
-
             if not matches_keywords(title):
                 continue
 
             print(f"  処理中: {title[:60]}...")
 
+            # 有料記事チェック
+            paywalled = is_paywalled(url)
+            if paywalled:
+                print(f"  有料記事を検出 → Web検索で分析します")
+
             try:
-                analysis = analyze(client, title, summary, source_name)
+                if paywalled:
+                    analysis = analyze_with_web_search(client, title, source_name)
+                else:
+                    analysis = analyze_normal(client, title, summary, source_name)
             except Exception as e:
                 print(f"  分析エラー: {e}")
                 time.sleep(30)
                 continue
 
             article = {
-                "url": url,
-                "title": title,
-                "source": source_name,
-                "published": published,
+                "url":          url,
+                "title":        title,
+                "source":       source_name,
+                "published":    published,
                 "collected_at": datetime.now().isoformat(),
-                "what": analysis.get("what", ""),
-                "why": analysis.get("why", ""),
-                "so_what": analysis.get("so_what", ""),
+                "web_searched": paywalled,
+                "what":         analysis.get("what", ""),
+                "why":          analysis.get("why", ""),
+                "so_what":      analysis.get("so_what", ""),
             }
 
             new_articles.append(article)
             existing_urls.add(url)
-            print(f"  ✓ 追加完了")
+            print(f"  ✓ 追加完了{'（Web検索）' if paywalled else ''}")
             time.sleep(30)
 
     all_articles = new_articles + existing
