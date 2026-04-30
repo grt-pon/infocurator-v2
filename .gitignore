@@ -1,6 +1,10 @@
 # 環境変数（絶対にコミットしない）
 .env
 
+# Gmail OAuth2 認証ファイル（絶対にコミットしない）
+gmail_credentials.json
+gmail_token.json
+
 # Python
 __pycache__/
 *.py[cod]

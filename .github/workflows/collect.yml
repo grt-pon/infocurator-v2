@@ -27,6 +27,19 @@ jobs:
       - name: 依存パッケージをインストール
         run: pip install -r requirements.txt
 
+      - name: Gmail 認証ファイルを設置
+        env:
+          GMAIL_CREDENTIALS: ${{ secrets.GMAIL_CREDENTIALS }}
+          GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN }}
+        run: |
+          if [ -n "$GMAIL_CREDENTIALS" ] && [ -n "$GMAIL_TOKEN" ]; then
+            echo "$GMAIL_CREDENTIALS" > gmail_credentials.json
+            echo "$GMAIL_TOKEN"       > gmail_token.json
+            echo "Gmail認証ファイルを設置しました"
+          else
+            echo "GMAIL_CREDENTIALS / GMAIL_TOKEN が未設定のためGmail収集をスキップします"
+          fi
+
       - name: collect.py を実行
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -36,7 +49,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add articles.json index.html
+          git add articles.json index.html processed_emails.json
           if git diff --cached --quiet; then
             echo "変更なし。コミットをスキップします。"
           else

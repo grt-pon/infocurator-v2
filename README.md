@@ -93,15 +93,19 @@ infocurator-v2/
 
 ## 情報源
 
-| 媒体 | RSS |
-|------|-----|
-| PR Times | https://prtimes.jp/index.rdf |
-| MarkeZine | https://markezine.jp/rss/new/20/index.xml |
-| AdverTimes | https://www.advertimes.com/feed/ |
+| 媒体 | 種別 | URL / 設定 |
+|------|------|-----------|
+| MarkeZine | RSS | https://markezine.jp/rss/new/20/index.xml |
+| AdverTimes | RSS | https://www.advertimes.com/feed/ |
+| DIGIDAY Japan | RSS | https://digiday.jp/feed/ |
+| ITmedia Marketing | RSS | https://rss.itmedia.co.jp/rss/2.0/marketing.xml |
+| 日経クロストレンド | Gmail | xtrend-e@nikkeibp.co.jp からのメルマガ |
 
 ## フィルタリングキーワード
 
-`キャンペーン` / `プロモーション` / `新発売` / `期間限定` / `コラボ` / `タイアップ` / `サンプリング` / `CM` / `広告`
+**RSS共通:** `キャンペーン` / `プロモーション` / `新発売` / `期間限定` / `コラボ` / `タイアップ` / `サンプリング` / `CM` / `広告` / `マーケティング` / `インフルエンサー` / `ブランド` / `SNS` / `市場` / `戦略` / `メディア` / `デジタル` / `リテール`
+
+**日経クロストレンド:** `キャンペーン` / `プロモーション` / `新発売` / `コラボ` / `ブランド` / `消費` / `広告` / `CM` / `ヒット` / `マーケ` / `トレンド` / `ランキング`
 
 ## AI分析（Claude Haiku）
 
@@ -110,3 +114,51 @@ infocurator-v2/
 | **What** | 何のキャンペーン・施策か（2文以内） |
 | **Why** | なぜこの施策か。企業戦略・業界背景から推測（3〜4文） |
 | **So What** | マーケターが自分の仕事に使えるインサイト（2〜3文） |
+
+有料記事・メール本文100文字未満の場合は Claude の `web_search_20250305` ツールで自動補完します。
+
+---
+
+## Gmail APIセットアップ（日経クロストレンド連携）
+
+### 1. Google Cloud Console で設定
+
+1. https://console.cloud.google.com/ を開く
+2. プロジェクトを選択（または新規作成）
+3. **「APIとサービス」→「ライブラリ」** で `Gmail API` を検索して有効化
+4. **「APIとサービス」→「認証情報」→「認証情報を作成」**
+   → `OAuth クライアント ID` → アプリの種類: `デスクトップアプリ` → 作成
+5. ダウンロードした JSON ファイルを `gmail_credentials.json` という名前で  
+   `infocurator-v2/` フォルダに保存
+
+### 2. OAuth 初回認証（ローカルで1回だけ実行）
+
+```bash
+python gmail_setup.py
+```
+
+- ブラウザが開くので Google アカウントでログインして権限を許可
+- `gmail_token.json` が生成されます（**絶対にコミットしないこと**）
+- スクリプトの最後に表示されるトークン内容をコピーしておく
+
+### 3. GitHub Secrets に登録
+
+リポジトリの **Settings → Secrets and variables → Actions** で以下を追加：
+
+| シークレット名 | 値 |
+|--------------|-----|
+| `ANTHROPIC_API_KEY` | Anthropic APIキー |
+| `GMAIL_CREDENTIALS` | `gmail_credentials.json` の内容（JSON全文） |
+| `GMAIL_TOKEN` | `gmail_token.json` の内容（JSON全文）|
+
+### 4. 環境変数（ローカル実行時）
+
+`.env` に追加（省略時はデフォルトファイル名を使用）：
+
+```
+GMAIL_CREDENTIALS_FILE=gmail_credentials.json
+GMAIL_TOKEN_FILE=gmail_token.json
+```
+
+> **注意:** `gmail_credentials.json` と `gmail_token.json` は `.gitignore` に含まれており、  
+> コミットされません。GitHub Actions では Secrets 経由で渡します。
