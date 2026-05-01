@@ -76,14 +76,14 @@ def main():
     profile = service.users().getProfile(userId="me").execute()
     print(f"✓ ログイン成功: {profile.get('emailAddress')}")
 
-    # 対象メールの確認
+    # 対象メールの確認（受信トレイ・過去7日以内）
     result = service.users().messages().list(
         userId="me",
-        q=f"from:{TEST_SENDER}",
+        q=f"from:{TEST_SENDER} label:INBOX newer_than:7d",
         maxResults=5,
     ).execute()
     count = result.get("resultSizeEstimate", 0)
-    print(f"✓ {TEST_SENDER} からのメール: {count} 件以上見つかりました")
+    print(f"✓ {TEST_SENDER} からのメール（受信トレイ・過去7日）: {count} 件見つかりました")
 
     print("\n" + "=" * 60)
     print("セットアップ完了！")

@@ -449,7 +449,7 @@ def save_articles(articles: list[dict]) -> None:
 
 def load_processed_emails() -> set[str]:
     if PROCESSED_EMAILS_FILE.exists():
-        with open(PROCESSED_EMAILS_FILE, encoding="utf-8") as f:
+        with open(PROCESSED_EMAILS_FILE, encoding="utf-8-sig") as f:  # BOM付きUTF-8も許容
             return set(json.load(f))
     return set()
 
@@ -630,28 +630,67 @@ def _extract_surrounding_text(a_tag) -> str:
     return surrounding[:500]
 
 
+def _clean_nikkei_title(raw: str) -> str:
+    """日経クロストレンドのリンクテキストからノイズを除去してタイトルを返す"""
+    title = raw
+
+    # 末尾の「» 記事を読む」「» 動画を見る」などを除去
+    import re
+    title = re.sub(r'[»›]\s*(記事を読む|動画を見る|続きを読む).*$', '', title)
+    # カテゴリラベル「マーケ・消費」などを除去
+    title = re.sub(r'マーケ・消費\s*$', '', title)
+    # 末尾の「»」「›」を除去
+    title = re.sub(r'[»›]\s*$', '', title)
+    # 先頭のセクション見出し（「テーマ別まとめ記事」など）を除去
+    title = re.sub(r'^(テーマ別まとめ記事|本日の|【[^】]*】)', '', title)
+
+    return title.strip()
+
+
 def parse_nikkei_email(html: str) -> list[dict]:
     """日経クロストレンドメールの HTML から記事リストを抽出"""
     soup = BeautifulSoup(html, "html.parser")
-    seen_urls = set()
-    articles  = []
+    seen_urls   = set()
+    seen_titles = set()   # タイトル先頭20文字で重複チェック
+    articles    = []
+
+    # スキップするリンクテキスト（完全一致）
+    SKIP_TEXTS = {
+        "購読する", "ログイン", "登録", "解除", "配信停止",
+        "お問い合わせ", "プライバシーポリシー", "利用規約",
+        "メルマガ登録", "バックナンバー", "会員登録",
+        "本日の最新記事一覧はこちら", "この記事を読む",
+        "詳細はこちら", "続きを読む", "もっと見る",
+        "ウェブで表示", "記事を読む", "動画を見る",
+        "日経IDのパスワードをお忘れの方",
+        "日経クロストレンドに関するよくある質問、お問い合わせ",
+    }
 
     for a in soup.find_all("a", href=True):
-        url   = a["href"].strip()
-        title = a.get_text(strip=True)
+        url       = a["href"].strip()
+        raw_title = a.get_text(strip=True)
+        title     = _clean_nikkei_title(raw_title)
 
-        # 最低限のバリデーション
+        # バリデーション
         if not title or len(title) < 10:
             continue
         if not url.startswith("http"):
             continue
-        # xtrend.nikkei.com ドメインの記事URLのみ対象
-        if "nikkei.com" not in url and "xtrend" not in url:
+        if raw_title in SKIP_TEXTS or title in SKIP_TEXTS:
             continue
+        # 広告・PR リンクを除外（URLに _ADV_ などのパターン）
+        if "広告" in title and len(title) < 20:
+            continue
+
+        # URL・タイトル重複除外
         if url in seen_urls:
+            continue
+        title_key = title[:20]
+        if title_key in seen_titles:
             continue
 
         seen_urls.add(url)
+        seen_titles.add(title_key)
         surrounding = _extract_surrounding_text(a)
         articles.append({"title": title, "url": url, "text": surrounding})
 
@@ -682,11 +721,11 @@ def fetch_gmail_articles(
         print(f"  Gmail APIエラー: {e}")
         return []
 
-    # 送信元でメール検索
+    # 送信元・受信トレイ・過去7日以内に絞って検索
     try:
         result = service.users().messages().list(
             userId="me",
-            q=f"from:{GMAIL_SENDER}",
+            q=f"from:{GMAIL_SENDER} label:INBOX newer_than:7d",
             maxResults=50,
         ).execute()
     except Exception as e:
