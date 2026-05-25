@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -7,6 +8,7 @@ import feedparser
 import requests
 import anthropic
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -47,6 +49,16 @@ PAYWALL_SIGNALS = [
     "ログインして続きを読む",
 ]
 
+# タイトルにこれらが含まれる記事は収集しない
+EXCLUDE_KEYWORDS = [
+    "講座", "研修", "OJT", "育成", "スキル", "ツール紹介",
+    "ツール50選", "ツール100選", "無料マーケツール",
+    "本日開催", "セミナー", "ウェビナー", "読み放題",
+    "年額プラン", "月額プラン", "お得なキャンペーン",
+    "Voicy", "音声編集部", "配信分まで",
+    "凄腕マーケターに共通する", "必要ですか？",
+]
+
 # ── Gmail（日経クロストレンド）設定 ───────────────────────────
 GMAIL_SENDER  = "xtrend-e@nikkeibp.co.jp"
 GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -67,25 +79,38 @@ FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-SYSTEM_PROMPT = """あなたはマーケティング専門家です。
-与えられた記事のタイトルと概要をもとに、以下のJSON形式のみで回答してください。
-説明文や前置きは一切不要です。JSONのみを出力してください。
-
-{
-  "what": "何のキャンペーン・施策か（2文以内）",
-  "why": "なぜこの施策か。企業戦略・業界背景から推測（3〜4文）",
-  "so_what": "マーケターが自分の仕事に使えるインサイト（2〜3文）"
+_ANALYSIS_SCHEMA = """{
+  "skip": false,
+  "what": "何をやった施策か。企業名・商品名・具体的な施策内容を含めて2文以内",
+  "why": "なぜこの施策をやったか。業界の文脈・競合状況・企業の戦略的背景から推測。抽象論ではなく具体的に3〜4文",
+  "so_what": "この施策から抽象化して、自分の企画・マーケに使える視点や問いを2〜3文。『〇〇という施策は△△という状況で有効』という形で書く"
 }"""
 
-WEB_SEARCH_SYSTEM_PROMPT = """あなたはマーケティング専門家です。
-与えられた記事タイトルをWeb検索して関連情報を収集し、以下のJSON形式のみで回答してください。
-説明文や前置きは一切不要です。JSONのみを出力してください。
+_ANALYSIS_INSTRUCTIONS = """あなたはマーケティング実務家です。
+以下の記事について分析してください。
 
-{
-  "what": "何のキャンペーン・施策か（2文以内）",
-  "why": "なぜこの施策か。企業戦略・業界背景から推測（3〜4文）",
-  "so_what": "マーケターが自分の仕事に使えるインサイト（2〜3文）"
-}"""
+【重要な前提】
+- 「スキルの磨き方」「ハウツー」「ツール紹介」「広告・PR記事」は分析不要。
+  その場合は {"skip": true, "reason": "スキップ理由"} のみ返してください。
+- 表面的な要約ではなく、実務で使える具体的な洞察を書いてください。
+- 「〇〇が重要です」「△△が必要です」のような抽象論は避けてください。
+
+以下のJSON形式のみで回答してください：
+"""
+
+SYSTEM_PROMPT = _ANALYSIS_INSTRUCTIONS + _ANALYSIS_SCHEMA
+
+WEB_SEARCH_SYSTEM_PROMPT = """あなたはマーケティング実務家です。
+与えられた記事タイトルをWeb検索して関連情報を収集し、分析してください。
+
+【重要な前提】
+- 「スキルの磨き方」「ハウツー」「ツール紹介」「広告・PR記事」は分析不要。
+  その場合は {"skip": true, "reason": "スキップ理由"} のみ返してください。
+- 表面的な要約ではなく、実務で使える具体的な洞察を書いてください。
+- 「〇〇が重要です」「△△が必要です」のような抽象論は避けてください。
+
+以下のJSON形式のみで回答してください：
+""" + _ANALYSIS_SCHEMA
 
 # ── HTMLテンプレート ──────────────────────────────────────────
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -477,6 +502,19 @@ def matches_keywords(title: str, keyword_list: list[str] = None) -> bool:
     return any(kw in title for kw in kws)
 
 
+def is_excluded(title: str) -> bool:
+    """除外キーワードが含まれていたら True"""
+    return any(kw in title for kw in EXCLUDE_KEYWORDS)
+
+
+def is_similar_title(title: str, existing_titles: set[str], threshold: float = 0.8) -> bool:
+    """既存タイトルと80%以上一致したら重複とみなす"""
+    for existing in existing_titles:
+        if SequenceMatcher(None, title, existing).ratio() >= threshold:
+            return True
+    return False
+
+
 # ── 有料記事の判定 ────────────────────────────────────────────
 
 def is_paywalled(url: str) -> bool:
@@ -635,7 +673,6 @@ def _clean_nikkei_title(raw: str) -> str:
     title = raw
 
     # 末尾の「» 記事を読む」「» 動画を見る」などを除去
-    import re
     title = re.sub(r'[»›]\s*(記事を読む|動画を見る|続きを読む).*$', '', title)
     # カテゴリラベル「マーケ・消費」などを除去
     title = re.sub(r'マーケ・消費\s*$', '', title)
@@ -702,6 +739,7 @@ def parse_nikkei_email(html: str) -> list[dict]:
 def fetch_gmail_articles(
     client: anthropic.Anthropic,
     existing_urls: set[str],
+    existing_titles: set[str],
     processed_email_ids: set[str],
 ) -> list[dict]:
     """日経クロストレンドのメールから記事を収集・分析して返す"""
@@ -774,8 +812,13 @@ def fetch_gmail_articles(
 
             if url in existing_urls:
                 continue
-
             if not matches_keywords(title, NIKKEI_KEYWORDS):
+                continue
+            if is_excluded(title):
+                print(f"    除外: {title[:55]}")
+                continue
+            if is_similar_title(title, existing_titles):
+                print(f"    重複スキップ: {title[:55]}")
                 continue
 
             use_web_search = len(text) < 100
@@ -793,6 +836,15 @@ def fetch_gmail_articles(
                 time.sleep(30)
                 continue
 
+            # skip: true の場合は保存しない
+            if analysis.get("skip"):
+                reason = analysis.get("reason", "")
+                print(f"    スキップ（AI判定）: {reason}")
+                existing_urls.add(url)
+                existing_titles.add(title)
+                time.sleep(30)
+                continue
+
             article = {
                 "url":          url,
                 "title":        title,
@@ -807,6 +859,7 @@ def fetch_gmail_articles(
 
             new_articles.append(article)
             existing_urls.add(url)
+            existing_titles.add(title)
             print(f"    ✓ 追加完了{'（Web検索）' if use_web_search else ''}")
             time.sleep(30)
 
@@ -823,6 +876,7 @@ def collect() -> None:
 
     existing            = load_existing_articles()
     existing_urls       = {a["url"] for a in existing}
+    existing_titles     = {a["title"] for a in existing}   # タイトル重複チェック用
     processed_email_ids = load_processed_emails()
     new_articles        = []
 
@@ -847,6 +901,12 @@ def collect() -> None:
                 continue
             if not matches_keywords(title):
                 continue
+            if is_excluded(title):
+                print(f"  除外: {title[:60]}")
+                continue
+            if is_similar_title(title, existing_titles):
+                print(f"  重複スキップ: {title[:60]}")
+                continue
 
             print(f"  処理中: {title[:60]}...")
 
@@ -864,6 +924,15 @@ def collect() -> None:
                 time.sleep(30)
                 continue
 
+            # skip: true の場合は保存しない
+            if analysis.get("skip"):
+                reason = analysis.get("reason", "")
+                print(f"  スキップ（AI判定）: {reason}")
+                existing_urls.add(url)
+                existing_titles.add(title)
+                time.sleep(30)
+                continue
+
             article = {
                 "url":          url,
                 "title":        title,
@@ -878,12 +947,13 @@ def collect() -> None:
 
             new_articles.append(article)
             existing_urls.add(url)
+            existing_titles.add(title)
             print(f"  ✓ 追加完了{'（Web検索）' if paywalled else ''}")
             time.sleep(30)
 
     # ── Gmail（日経クロストレンド） ──────────────────────────
     print(f"\n[{NIKKEI_SOURCE}] Gmail取得中: {GMAIL_SENDER}")
-    gmail_articles = fetch_gmail_articles(client, existing_urls, processed_email_ids)
+    gmail_articles = fetch_gmail_articles(client, existing_urls, existing_titles, processed_email_ids)
     new_articles.extend(gmail_articles)
 
     # ── 保存 ────────────────────────────────────────────────
