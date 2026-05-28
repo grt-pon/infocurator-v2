@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import base64
+import argparse
 import feedparser
 import requests
 import anthropic
@@ -934,6 +935,130 @@ def fetch_gmail_articles(
     return new_articles
 
 
+# ── ドライラン（API呼び出しなし） ────────────────────────────
+
+def dry_run() -> None:
+    """
+    --dry-run モード:
+      RSS / Gmail からタイトルを取得し、フィルタ①（キーワード除外）のみ実行。
+      Claude API・Web検索は一切呼ばない。
+      「○件取得、フィルタ①で○件除外、残り○件」を表示して終了。
+    """
+    existing       = load_existing_articles()
+    existing_urls  = {a["url"] for a in existing}
+    existing_titles = {a["title"] for a in existing}
+
+    feedparser.USER_AGENT = FETCH_HEADERS["User-Agent"]
+
+    total_fetched  = 0
+    total_excluded = 0
+    total_dup      = 0
+    candidates     = []   # (source, title)
+
+    # ── RSS ──────────────────────────────────────────────────
+    for source_name, feed_url in RSS_FEEDS.items():
+        print(f"\n[{source_name}] フィード取得中...")
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"  取得エラー: {e}")
+            continue
+
+        for entry in feed.entries:
+            url   = getattr(entry, "link",  "")
+            title = getattr(entry, "title", "")
+
+            if not url or url in existing_urls:
+                continue
+            if not matches_keywords(title):
+                continue
+
+            total_fetched += 1
+
+            if is_excluded(title):
+                total_excluded += 1
+                print(f"  [除外①] {title[:65]}")
+                continue
+            if is_similar_title(title, existing_titles):
+                total_dup += 1
+                print(f"  [重複]  {title[:65]}")
+                continue
+
+            candidates.append((source_name, title))
+            print(f"  [通過]  {title[:65]}")
+
+    # ── Gmail ─────────────────────────────────────────────────
+    credentials_file = os.getenv("GMAIL_CREDENTIALS_FILE", "gmail_credentials.json")
+    token_file       = os.getenv("GMAIL_TOKEN_FILE",       "gmail_token.json")
+
+    if Path(credentials_file).exists() or Path(token_file).exists():
+        print(f"\n[{NIKKEI_SOURCE}] Gmail取得中（ドライラン）...")
+        try:
+            service = get_gmail_service()
+            result  = service.users().messages().list(
+                userId="me",
+                q=f"from:{GMAIL_SENDER} label:INBOX newer_than:7d",
+                maxResults=50,
+            ).execute()
+            messages = result.get("messages", [])
+            processed_email_ids = load_processed_emails()
+
+            for msg_ref in messages:
+                msg_id = msg_ref["id"]
+                if msg_id in processed_email_ids:
+                    continue
+                msg = service.users().messages().get(
+                    userId="me", id=msg_id, format="full"
+                ).execute()
+                headers  = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
+                subject  = headers.get("Subject", "(件名なし)")
+                html_body = _extract_email_html(msg)
+                if not html_body:
+                    continue
+
+                articles_data = parse_nikkei_email(html_body)
+                print(f"  メール: {subject[:50]}  ({len(articles_data)}件候補)")
+
+                for art in articles_data:
+                    title = art["title"]
+                    url   = art["url"]
+                    if url in existing_urls:
+                        continue
+                    if not matches_keywords(title, NIKKEI_KEYWORDS):
+                        continue
+                    if is_similar_title(title, existing_titles):
+                        total_dup += 1
+                        continue
+
+                    total_fetched += 1
+
+                    if is_excluded(title):
+                        total_excluded += 1
+                        print(f"    [除外①] {title[:60]}")
+                    else:
+                        candidates.append((NIKKEI_SOURCE, title))
+                        print(f"    [通過]  {title[:60]}")
+
+        except Exception as e:
+            print(f"  Gmailエラー: {e}")
+    else:
+        print(f"\n[{NIKKEI_SOURCE}] Gmail認証未設定のためスキップ")
+
+    # ── 結果サマリ ────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print(f"[ドライラン結果]")
+    print(f"  取得件数     : {total_fetched} 件")
+    print(f"  フィルタ①除外: {total_excluded} 件（キーワード除外）")
+    print(f"  重複スキップ : {total_dup} 件")
+    print(f"  残り（本番で分析対象）: {len(candidates)} 件")
+    if candidates:
+        print("\n  本番分析予定タイトル:")
+        for src, ttl in candidates:
+            print(f"    [{src}] {ttl[:60]}")
+    print("=" * 60)
+    print("\n本番実行する場合: python3 collect.py")
+
+
 # ── メイン収集処理 ────────────────────────────────────────────
 
 def collect() -> None:
@@ -1030,4 +1155,15 @@ def collect() -> None:
 
 
 if __name__ == "__main__":
-    collect()
+    parser = argparse.ArgumentParser(description="InfoCurator v2 記事収集スクリプト")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="APIを呼ばずにタイトル取得とフィルタ①のみ実行して終了",
+    )
+    args = parser.parse_args()
+
+    if args.dry_run:
+        dry_run()
+    else:
+        collect()
