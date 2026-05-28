@@ -49,14 +49,15 @@ PAYWALL_SIGNALS = [
     "ログインして続きを読む",
 ]
 
-# タイトルにこれらが含まれる記事は収集しない
+# タイトルにこれらが含まれる記事は収集しない（フィルタ①）
 EXCLUDE_KEYWORDS = [
-    "講座", "研修", "OJT", "育成", "スキル", "ツール紹介",
-    "ツール50選", "ツール100選", "無料マーケツール",
-    "本日開催", "セミナー", "ウェビナー", "読み放題",
+    "講座", "研修", "OJT", "育成", "スキル",
+    "ツール紹介", "ツール50選", "ツール100選", "無料マーケツール",
+    "セミナー", "ウェビナー", "読み放題",
     "年額プラン", "月額プラン", "お得なキャンペーン",
     "Voicy", "音声編集部", "配信分まで",
-    "凄腕マーケターに共通する", "必要ですか？",
+    "必要ですか？", "本出しました",
+    "西口さん", "音部大輔",
 ]
 
 # ── Gmail（日経クロストレンド）設定 ───────────────────────────
@@ -73,7 +74,9 @@ NIKKEI_KEYWORDS = [
 OUTPUT_FILE           = Path("articles.json")
 PROCESSED_EMAILS_FILE = Path("processed_emails.json")
 HTML_FILE             = Path("index.html")
-MODEL                 = "claude-haiku-4-5-20251001"
+MODEL                 = "claude-haiku-4-5-20251001"   # RSS分析（安価）
+MODEL_RELEVANCE       = "claude-haiku-4-5-20251001"   # Gmail フィルタ②（安価）
+MODEL_ANALYSIS        = "claude-sonnet-4-5-20251001"  # Gmail 本格分析（高精度）
 
 FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -541,7 +544,10 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
-def analyze_normal(client: anthropic.Anthropic, title: str, summary: str, source: str) -> dict:
+def analyze_normal(
+    client: anthropic.Anthropic, title: str, summary: str, source: str,
+    model: str = MODEL,
+) -> dict:
     """通常記事：テキストで分析"""
     user_message = (
         f"情報源: {source}\n"
@@ -549,7 +555,7 @@ def analyze_normal(client: anthropic.Anthropic, title: str, summary: str, source
         f"概要: {summary[:500] if summary else '（概要なし）'}"
     )
     message = client.messages.create(
-        model=MODEL,
+        model=model,
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
@@ -557,7 +563,10 @@ def analyze_normal(client: anthropic.Anthropic, title: str, summary: str, source
     return _extract_json(message.content[0].text)
 
 
-def analyze_with_web_search(client: anthropic.Anthropic, title: str, source: str) -> dict:
+def analyze_with_web_search(
+    client: anthropic.Anthropic, title: str, source: str,
+    model: str = MODEL,
+) -> dict:
     """有料記事・本文不足：web_search ツールで関連情報を収集して分析"""
     user_message = (
         f"「{title}」（情報源: {source}）について検索し、"
@@ -565,7 +574,7 @@ def analyze_with_web_search(client: anthropic.Anthropic, title: str, source: str
         "検索結果をもとに、指定のJSON形式のみで回答してください。"
     )
     response = client.beta.messages.create(
-        model=MODEL,
+        model=model,
         max_tokens=2048,
         system=WEB_SEARCH_SYSTEM_PROMPT,
         tools=[{
@@ -580,6 +589,34 @@ def analyze_with_web_search(client: anthropic.Anthropic, title: str, source: str
         if hasattr(block, "text") and block.text.strip():
             return _extract_json(block.text)
     raise ValueError("web_search 分析でテキスト応答が得られませんでした")
+
+
+# ── Gmail フィルタ② 関連性チェック ───────────────────────────
+
+def check_relevance(client: anthropic.Anthropic, title: str) -> bool:
+    """フィルタ②: ぐるっとポン視点での関連性をHaikuで判定（API1回・低コスト）"""
+    prompt = (
+        f"記事タイトル: 「{title}」\n\n"
+        f"このタイトルのカテゴリを1〜6から選んでください。\n"
+        f"1: B2B・SaaS・法人向けサービス\n"
+        f"2: テレビ・ラジオ・Podcast・出版・メディア業界\n"
+        f"3: 金融・保険・不動産・医療\n"
+        f"4: マーケターのキャリア・スキル・業界展望の論評\n"
+        f"5: 海外事例のみ（日本市場と無関係）\n"
+        f"6: 消費財・小売・アプリ・生活者向けマーケ施策（上記以外）\n\n"
+        f"カテゴリ番号が1〜5なら {{\"relevant\": false}}、6なら {{\"relevant\": true}} を返してください。\n"
+        f'{{\"relevant\": true}} か {{\"relevant\": false}} のみ返してください。'
+    )
+    try:
+        message = client.messages.create(
+            model=MODEL_RELEVANCE,
+            max_tokens=64,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        data = _extract_json(message.content[0].text)
+        return bool(data.get("relevant", False))
+    except Exception:
+        return True  # 判定失敗時は通過させて本格分析へ
 
 
 # ── Gmail 認証 ────────────────────────────────────────────────
@@ -805,32 +842,55 @@ def fetch_gmail_articles(
         articles_data = parse_nikkei_email(html_body)
         print(f"    記事候補: {len(articles_data)} 件")
 
+        # ── 2段階フィルタリング ──────────────────────────────────
+        cnt_f1_skip = 0   # フィルタ① 除外
+        cnt_f2_skip = 0   # フィルタ② 非関連
+        cnt_analyzed = 0  # 本格分析実行
+
         for article_data in articles_data:
             title = article_data["title"]
             url   = article_data["url"]
             text  = article_data["text"]
 
+            # URL・タイトル重複チェック
             if url in existing_urls:
                 continue
             if not matches_keywords(title, NIKKEI_KEYWORDS):
                 continue
-            if is_excluded(title):
-                print(f"    除外: {title[:55]}")
-                continue
             if is_similar_title(title, existing_titles):
-                print(f"    重複スキップ: {title[:55]}")
                 continue
 
+            # ── フィルタ①: キーワードで機械的に除外（APIなし）──
+            if is_excluded(title):
+                cnt_f1_skip += 1
+                existing_urls.add(url)
+                existing_titles.add(title)
+                continue
+
+            # ── フィルタ②: Haikuで関連性を判定 ──────────────
+            if not check_relevance(client, title):
+                cnt_f2_skip += 1
+                print(f"    フィルタ②非関連: {title[:50]}")
+                existing_urls.add(url)
+                existing_titles.add(title)
+                continue
+
+            # ── 本格分析: Web検索 → Sonnetで分析 ────────────
+            cnt_analyzed += 1
             use_web_search = len(text) < 100
             print(f"    処理中: {title[:55]}...")
             if use_web_search:
-                print(f"    本文不足 → Web検索で補完分析")
+                print(f"    本文不足 → Web検索で補完分析（Sonnet）")
 
             try:
                 if use_web_search:
-                    analysis = analyze_with_web_search(client, title, NIKKEI_SOURCE)
+                    analysis = analyze_with_web_search(
+                        client, title, NIKKEI_SOURCE, model=MODEL_ANALYSIS
+                    )
                 else:
-                    analysis = analyze_normal(client, title, text, NIKKEI_SOURCE)
+                    analysis = analyze_normal(
+                        client, title, text, NIKKEI_SOURCE, model=MODEL_ANALYSIS
+                    )
             except Exception as e:
                 print(f"    分析エラー: {e}")
                 time.sleep(30)
@@ -838,8 +898,7 @@ def fetch_gmail_articles(
 
             # skip: true の場合は保存しない
             if analysis.get("skip"):
-                reason = analysis.get("reason", "")
-                print(f"    スキップ（AI判定）: {reason}")
+                print(f"    スキップ（AI判定）: {analysis.get('reason', '')}")
                 existing_urls.add(url)
                 existing_titles.add(title)
                 time.sleep(30)
@@ -862,6 +921,12 @@ def fetch_gmail_articles(
             existing_titles.add(title)
             print(f"    ✓ 追加完了{'（Web検索）' if use_web_search else ''}")
             time.sleep(30)
+
+        # フィルタ集計ログ
+        if articles_data:
+            print(f"    ▶ フィルタ①で{cnt_f1_skip}件除外、"
+                  f"フィルタ②で{cnt_f2_skip}件除外、"
+                  f"{cnt_analyzed}件を本格分析")
 
         # 処理済みとしてマーク
         processed_email_ids.add(msg_id)
