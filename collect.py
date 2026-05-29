@@ -50,17 +50,6 @@ PAYWALL_SIGNALS = [
     "ログインして続きを読む",
 ]
 
-# タイトルにこれらが含まれる記事は収集しない（フィルタ①）
-EXCLUDE_KEYWORDS = [
-    "講座", "研修", "OJT", "育成", "スキル",
-    "ツール紹介", "ツール50選", "ツール100選", "無料マーケツール",
-    "セミナー", "ウェビナー", "読み放題",
-    "年額プラン", "月額プラン", "お得なキャンペーン",
-    "Voicy", "音声編集部", "配信分まで",
-    "必要ですか？", "本出しました",
-    "西口さん", "音部大輔",
-]
-
 # ── Gmail（日経クロストレンド）設定 ───────────────────────────
 GMAIL_SENDER  = "xtrend-e@nikkeibp.co.jp"
 GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -76,7 +65,7 @@ OUTPUT_FILE           = Path("articles.json")
 PROCESSED_EMAILS_FILE = Path("processed_emails.json")
 HTML_FILE             = Path("index.html")
 MODEL                 = "claude-haiku-4-5-20251001"   # RSS分析（安価）
-MODEL_RELEVANCE       = "claude-haiku-4-5-20251001"   # Gmail フィルタ②（安価）
+MODEL_RELEVANCE       = "claude-haiku-4-5-20251001"   # フィルタ①②（安価）
 MODEL_ANALYSIS        = "claude-sonnet-4-5-20251001"  # Gmail 本格分析（高精度）
 
 FETCH_HEADERS = {
@@ -506,11 +495,6 @@ def matches_keywords(title: str, keyword_list: list[str] = None) -> bool:
     return any(kw in title for kw in kws)
 
 
-def is_excluded(title: str) -> bool:
-    """除外キーワードが含まれていたら True"""
-    return any(kw in title for kw in EXCLUDE_KEYWORDS)
-
-
 def is_similar_title(title: str, existing_titles: set[str], threshold: float = 0.8) -> bool:
     """既存タイトルと80%以上一致したら重複とみなす"""
     for existing in existing_titles:
@@ -532,7 +516,7 @@ def is_paywalled(url: str) -> bool:
 # ── AI 分析 ───────────────────────────────────────────────────
 
 def _extract_json(text: str) -> dict:
-    """レスポンステキストから JSON を抽出してパース"""
+    """レスポンステキストから JSON オブジェクトを抽出してパース"""
     text = text.strip()
     if "```" in text:
         text = text.split("```")[1]
@@ -540,6 +524,25 @@ def _extract_json(text: str) -> dict:
             text = text[4:]
     start = text.find("{")
     end   = text.rfind("}") + 1
+    if start != -1 and end > start:
+        text = text[start:end]
+    return json.loads(text)
+
+
+def _extract_json_list(text: str) -> list:
+    """レスポンステキストから JSON 配列を抽出してパース"""
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts[1:]:
+            if part.startswith("json"):
+                part = part[4:]
+            part = part.strip()
+            if part.startswith("["):
+                text = part
+                break
+    start = text.find("[")
+    end   = text.rfind("]") + 1
     if start != -1 and end > start:
         text = text[start:end]
     return json.loads(text)
@@ -592,7 +595,57 @@ def analyze_with_web_search(
     raise ValueError("web_search 分析でテキスト応答が得られませんでした")
 
 
-# ── Gmail フィルタ② 関連性チェック ───────────────────────────
+# ── フィルタ①: AI一括フィルタ ────────────────────────────────
+
+def batch_filter_titles(client: anthropic.Anthropic, titles: list[str]) -> set[str]:
+    """
+    全タイトルを1回のHaiku呼び出しで一括フィルタリング。
+    マーケ実務で参考になる記事タイトルのセットを返す。
+    パース失敗時は全タイトルを返す（安全側に倒す）。
+    """
+    if not titles:
+        return set()
+
+    titles_text = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
+    prompt = (
+        "以下の記事タイトルリストについて、マーケ・企画担当者が実務で参考にできる"
+        "具体的な施策・事例・市場トレンドの記事かどうかを判断してください。\n\n"
+        "除外する条件（いずれか該当すれば除外）：\n"
+        "・アンケート・調査協力依頼（「ご協力お願いします」など）\n"
+        "・ツール紹介・講座・セミナー・ウェビナー案内\n"
+        "・メディア自社のお知らせ・周年記念\n"
+        "・スキル論・ハウツー・本の紹介・キャリア論\n"
+        "・抽象論のみで具体的な施策・事例がない記事\n"
+        "・特定人物への言及・インタビュー企画の案内\n\n"
+        f"タイトルリスト：\n{titles_text}\n\n"
+        "「関連あり」と判断した記事の番号のみを、カンマ区切りで返してください。\n"
+        "他のテキストは一切不要です。\n"
+        "例: 1,3,5,8,12"
+    )
+
+    try:
+        message = client.messages.create(
+            model=MODEL_RELEVANCE,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = message.content[0].text.strip()
+        # "1,3,5" または "1, 3, 5" 形式をパース
+        relevant_indices = set()
+        for part in re.split(r"[,\s]+", response_text):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1  # 1始まりを0始まりに変換
+                if 0 <= idx < len(titles):
+                    relevant_indices.add(idx)
+        return {titles[i] for i in relevant_indices}
+    except Exception as e:
+        print(f"  ⚠️  AI一括フィルタのパースに失敗: {e}")
+        print("  → 全タイトルを通過させます（安全側）")
+        return set(titles)
+
+
+# ── フィルタ②: Gmail 関連性チェック ──────────────────────────
 
 def check_relevance(client: anthropic.Anthropic, title: str) -> bool:
     """フィルタ②: ぐるっとポン視点での関連性をHaikuで判定（API1回・低コスト）"""
@@ -779,6 +832,7 @@ def fetch_gmail_articles(
     existing_urls: set[str],
     existing_titles: set[str],
     processed_email_ids: set[str],
+    limit: int | None = None,
 ) -> list[dict]:
     """日経クロストレンドのメールから記事を収集・分析して返す"""
 
@@ -808,16 +862,17 @@ def fetch_gmail_articles(
         print(f"  メール一覧取得エラー: {e}")
         return []
 
-    messages  = result.get("messages", [])
-    new_articles = []
+    messages = result.get("messages", [])
+
+    # ── 第1パス: 全メールから候補を収集 ─────────────────────────
+    gmail_candidates = []   # {"title", "url", "text", "date", "msg_id"}
+    seen_msg_ids     = []   # 今回処理したメールID（処理済みマーク用）
 
     for msg_ref in messages:
         msg_id = msg_ref["id"]
-
         if msg_id in processed_email_ids:
             continue
 
-        # メール全文取得
         try:
             msg = service.users().messages().get(
                 userId="me", id=msg_id, format="full"
@@ -826,34 +881,27 @@ def fetch_gmail_articles(
             print(f"  メール取得エラー ({msg_id}): {e}")
             continue
 
-        # 送信日時を取得
         headers   = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
         date_str  = headers.get("Date", "")
         subject   = headers.get("Subject", "(件名なし)")
         print(f"  メール: {subject[:50]}")
 
-        # HTMLボディ抽出
         html_body = _extract_email_html(msg)
         if not html_body:
             print(f"    HTMLボディなし → スキップ")
             processed_email_ids.add(msg_id)
             continue
 
-        # 記事パース
         articles_data = parse_nikkei_email(html_body)
         print(f"    記事候補: {len(articles_data)} 件")
 
-        # ── 2段階フィルタリング ──────────────────────────────────
-        cnt_f1_skip = 0   # フィルタ① 除外
-        cnt_f2_skip = 0   # フィルタ② 非関連
-        cnt_analyzed = 0  # 本格分析実行
+        seen_msg_ids.append(msg_id)
 
         for article_data in articles_data:
             title = article_data["title"]
             url   = article_data["url"]
             text  = article_data["text"]
 
-            # URL・タイトル重複チェック
             if url in existing_urls:
                 continue
             if not matches_keywords(title, NIKKEI_KEYWORDS):
@@ -861,99 +909,136 @@ def fetch_gmail_articles(
             if is_similar_title(title, existing_titles):
                 continue
 
-            # ── フィルタ①: キーワードで機械的に除外（APIなし）──
-            if is_excluded(title):
-                cnt_f1_skip += 1
-                existing_urls.add(url)
-                existing_titles.add(title)
-                continue
+            gmail_candidates.append({
+                "title":  title,
+                "url":    url,
+                "text":   text,
+                "date":   date_str,
+                "msg_id": msg_id,
+            })
+            existing_titles.add(title)  # 重複防止のため先に登録
 
-            # ── フィルタ②: Haikuで関連性を判定 ──────────────
-            if not check_relevance(client, title):
-                cnt_f2_skip += 1
-                print(f"    フィルタ②非関連: {title[:50]}")
-                existing_urls.add(url)
-                existing_titles.add(title)
-                continue
+    if not gmail_candidates:
+        for msg_id in seen_msg_ids:
+            processed_email_ids.add(msg_id)
+        return []
 
-            # ── 本格分析: Web検索 → Sonnetで分析 ────────────
-            cnt_analyzed += 1
-            use_web_search = len(text) < 100
-            print(f"    処理中: {title[:55]}...")
-            if use_web_search:
-                print(f"    本文不足 → Web検索で補完分析（Sonnet）")
+    # ── フィルタ①: AI一括フィルタ ─────────────────────────────
+    all_titles = [c["title"] for c in gmail_candidates]
+    print(f"\n  [AI一括フィルタ] Gmail {len(all_titles)}件をHaikuで判定中...")
+    relevant_titles = batch_filter_titles(client, all_titles)
 
-            try:
-                if use_web_search:
-                    analysis = analyze_with_web_search(
-                        client, title, NIKKEI_SOURCE, model=MODEL_ANALYSIS
-                    )
-                else:
-                    analysis = analyze_normal(
-                        client, title, text, NIKKEI_SOURCE, model=MODEL_ANALYSIS
-                    )
-            except Exception as e:
-                print(f"    分析エラー: {e}")
-                time.sleep(30)
-                continue
+    f1_excluded = [c for c in gmail_candidates if c["title"] not in relevant_titles]
+    f1_passed   = [c for c in gmail_candidates if c["title"] in relevant_titles]
 
-            # skip: true の場合は保存しない
-            if analysis.get("skip"):
-                print(f"    スキップ（AI判定）: {analysis.get('reason', '')}")
-                existing_urls.add(url)
-                existing_titles.add(title)
-                time.sleep(30)
-                continue
+    for c in f1_excluded:
+        print(f"    [AI除外①] {c['title'][:60]}")
+        existing_urls.add(c["url"])
 
-            article = {
-                "url":          url,
-                "title":        title,
-                "source":       NIKKEI_SOURCE,
-                "published":    date_str,
-                "collected_at": datetime.now().isoformat(),
-                "web_searched": use_web_search,
-                "what":         analysis.get("what", ""),
-                "why":          analysis.get("why", ""),
-                "so_what":      analysis.get("so_what", ""),
-            }
+    # --limit が指定されている場合は上位 N 件に絞る
+    if limit is not None:
+        f1_passed = f1_passed[:limit]
 
-            new_articles.append(article)
+    print(f"  フィルタ①: {len(f1_excluded)}件除外 / {len(f1_passed)}件通過"
+          + (f"（上限 {limit} 件）" if limit is not None else ""))
+
+    # ── フィルタ②: Haikuで関連性を判定 + 本格分析 ────────────
+    new_articles = []
+    cnt_f2_skip  = 0
+    cnt_analyzed = 0
+
+    for candidate in f1_passed:
+        title    = candidate["title"]
+        url      = candidate["url"]
+        text     = candidate["text"]
+        date_str = candidate["date"]
+
+        # フィルタ②: ぐるっとポン関連性チェック
+        if not check_relevance(client, title):
+            cnt_f2_skip += 1
+            print(f"    フィルタ②非関連: {title[:50]}")
             existing_urls.add(url)
-            existing_titles.add(title)
-            print(f"    ✓ 追加完了{'（Web検索）' if use_web_search else ''}")
+            continue
+
+        # 本格分析: Web検索 → Sonnetで分析
+        cnt_analyzed += 1
+        use_web_search = len(text) < 100
+        print(f"    処理中: {title[:55]}...")
+        if use_web_search:
+            print(f"    本文不足 → Web検索で補完分析（Sonnet）")
+
+        try:
+            if use_web_search:
+                analysis = analyze_with_web_search(
+                    client, title, NIKKEI_SOURCE, model=MODEL_ANALYSIS
+                )
+            else:
+                analysis = analyze_normal(
+                    client, title, text, NIKKEI_SOURCE, model=MODEL_ANALYSIS
+                )
+        except Exception as e:
+            print(f"    分析エラー: {e}")
             time.sleep(30)
+            continue
 
-        # フィルタ集計ログ
-        if articles_data:
-            print(f"    ▶ フィルタ①で{cnt_f1_skip}件除外、"
-                  f"フィルタ②で{cnt_f2_skip}件除外、"
-                  f"{cnt_analyzed}件を本格分析")
+        if analysis.get("skip"):
+            print(f"    スキップ（AI判定）: {analysis.get('reason', '')}")
+            existing_urls.add(url)
+            time.sleep(30)
+            continue
 
-        # 処理済みとしてマーク
+        article = {
+            "url":          url,
+            "title":        title,
+            "source":       NIKKEI_SOURCE,
+            "published":    date_str,
+            "collected_at": datetime.now().isoformat(),
+            "web_searched": use_web_search,
+            "what":         analysis.get("what", ""),
+            "why":          analysis.get("why", ""),
+            "so_what":      analysis.get("so_what", ""),
+        }
+
+        new_articles.append(article)
+        existing_urls.add(url)
+        print(f"    ✓ 追加完了{'（Web検索）' if use_web_search else ''}")
+        time.sleep(30)
+
+    print(f"\n  ▶ フィルタ①で{len(f1_excluded)}件除外、"
+          f"フィルタ②で{cnt_f2_skip}件除外、"
+          f"{cnt_analyzed}件を本格分析")
+
+    # 処理済みとしてマーク
+    for msg_id in seen_msg_ids:
         processed_email_ids.add(msg_id)
 
     return new_articles
 
 
-# ── ドライラン（API呼び出しなし） ────────────────────────────
+# ── ドライラン ────────────────────────────────────────────────
 
 def dry_run() -> None:
     """
     --dry-run モード:
-      RSS / Gmail からタイトルを取得し、フィルタ①（キーワード除外）のみ実行。
-      Claude API・Web検索は一切呼ばない。
-      「○件取得、フィルタ①で○件除外、残り○件」を表示して終了。
+      RSS / Gmail からタイトルを取得し、AI一括フィルタ①を実行して結果を表示。
+      本格分析（Web検索・Sonnet）は一切呼ばない。
+      ※ Haiku API 1回分の課金が発生します。
     """
-    existing       = load_existing_articles()
-    existing_urls  = {a["url"] for a in existing}
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("⚠️  ANTHROPIC_API_KEY が未設定です。AI一括フィルタをスキップします。")
+        client = None
+    else:
+        client = anthropic.Anthropic(api_key=api_key)
+
+    existing        = load_existing_articles()
+    existing_urls   = {a["url"] for a in existing}
     existing_titles = {a["title"] for a in existing}
 
     feedparser.USER_AGENT = FETCH_HEADERS["User-Agent"]
 
-    total_fetched  = 0
-    total_excluded = 0
-    total_dup      = 0
-    candidates     = []   # (source, title)
+    total_dup   = 0
+    candidates  = []   # (source, title)
 
     # ── RSS ──────────────────────────────────────────────────
     for source_name, feed_url in RSS_FEEDS.items():
@@ -972,24 +1057,20 @@ def dry_run() -> None:
                 continue
             if not matches_keywords(title):
                 continue
-
-            total_fetched += 1
-
-            if is_excluded(title):
-                total_excluded += 1
-                print(f"  [除外①] {title[:65]}")
-                continue
             if is_similar_title(title, existing_titles):
                 total_dup += 1
                 print(f"  [重複]  {title[:65]}")
                 continue
 
             candidates.append((source_name, title))
-            print(f"  [通過]  {title[:65]}")
+            existing_titles.add(title)
+
+    total_fetched_rss = len(candidates) + total_dup
 
     # ── Gmail ─────────────────────────────────────────────────
     credentials_file = os.getenv("GMAIL_CREDENTIALS_FILE", "gmail_credentials.json")
     token_file       = os.getenv("GMAIL_TOKEN_FILE",       "gmail_token.json")
+    gmail_candidate_count_before = len(candidates)
 
     if Path(credentials_file).exists() or Path(token_file).exists():
         print(f"\n[{NIKKEI_SOURCE}] Gmail取得中（ドライラン）...")
@@ -1000,8 +1081,8 @@ def dry_run() -> None:
                 q=f"from:{GMAIL_SENDER} label:INBOX newer_than:7d",
                 maxResults=50,
             ).execute()
-            messages = result.get("messages", [])
-            processed_email_ids = load_processed_emails()
+            messages             = result.get("messages", [])
+            processed_email_ids  = load_processed_emails()
 
             for msg_ref in messages:
                 msg_id = msg_ref["id"]
@@ -1010,8 +1091,8 @@ def dry_run() -> None:
                 msg = service.users().messages().get(
                     userId="me", id=msg_id, format="full"
                 ).execute()
-                headers  = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
-                subject  = headers.get("Subject", "(件名なし)")
+                headers   = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
+                subject   = headers.get("Subject", "(件名なし)")
                 html_body = _extract_email_html(msg)
                 if not html_body:
                     continue
@@ -1030,49 +1111,68 @@ def dry_run() -> None:
                         total_dup += 1
                         continue
 
-                    total_fetched += 1
-
-                    if is_excluded(title):
-                        total_excluded += 1
-                        print(f"    [除外①] {title[:60]}")
-                    else:
-                        candidates.append((NIKKEI_SOURCE, title))
-                        print(f"    [通過]  {title[:60]}")
+                    candidates.append((NIKKEI_SOURCE, title))
+                    existing_titles.add(title)
 
         except Exception as e:
             print(f"  Gmailエラー: {e}")
     else:
         print(f"\n[{NIKKEI_SOURCE}] Gmail認証未設定のためスキップ")
 
+    # ── AI一括フィルタ（フィルタ①） ──────────────────────────
+    print(f"\n{'=' * 60}")
+
+    if client and candidates:
+        print(f"⚠️  Haiku API 1回分の課金が発生します")
+        print(f"\n[AI一括フィルタ] {len(candidates)}件をHaikuで判定中...")
+        all_titles      = [t for _, t in candidates]
+        relevant_titles = batch_filter_titles(client, all_titles)
+
+        passed   = [(s, t) for s, t in candidates if t in relevant_titles]
+        excluded = [(s, t) for s, t in candidates if t not in relevant_titles]
+    else:
+        if not client:
+            print("  AI一括フィルタ: APIキー未設定のためスキップ（全件を候補として表示）")
+        passed   = candidates
+        excluded = []
+
     # ── 結果サマリ ────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print(f"[ドライラン結果]")
-    print(f"  取得件数     : {total_fetched} 件")
-    print(f"  フィルタ①除外: {total_excluded} 件（キーワード除外）")
-    print(f"  重複スキップ : {total_dup} 件")
-    print(f"  残り（本番で分析対象）: {len(candidates)} 件")
-    if candidates:
-        print("\n  本番分析予定タイトル:")
-        for src, ttl in candidates:
-            print(f"    [{src}] {ttl[:60]}")
+    print(f"\n[ドライラン結果]")
+    print(f"  取得件数（キーワード一致）: {len(candidates) + total_dup} 件")
+    print(f"  重複スキップ              : {total_dup} 件")
+    print(f"  AI一括フィルタ①除外      : {len(excluded)} 件")
+    print(f"  残り（本番で分析対象）    : {len(passed)} 件")
+
+    if excluded:
+        print(f"\n  ── AI除外①タイトル ──")
+        for src, ttl in excluded:
+            print(f"    [{src}] {ttl[:65]}")
+
+    if passed:
+        print(f"\n  ── 本番分析予定タイトル ──")
+        for src, ttl in passed:
+            print(f"    [{src}] {ttl[:65]}")
+
     print("=" * 60)
     print("\n本番実行する場合: python3 collect.py")
 
 
 # ── メイン収集処理 ────────────────────────────────────────────
 
-def collect() -> None:
+def collect(limit: int | None = None) -> None:
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     existing            = load_existing_articles()
     existing_urls       = {a["url"] for a in existing}
-    existing_titles     = {a["title"] for a in existing}   # タイトル重複チェック用
+    existing_titles     = {a["title"] for a in existing}
     processed_email_ids = load_processed_emails()
     new_articles        = []
 
     feedparser.USER_AGENT = FETCH_HEADERS["User-Agent"]
 
-    # ── RSS フィード ─────────────────────────────────────────
+    # ── RSS: 第1パス（候補収集） ─────────────────────────────
+    rss_candidates = []   # {"source", "url", "title", "summary", "published"}
+
     for source_name, feed_url in RSS_FEEDS.items():
         print(f"\n[{source_name}] フィード取得中: {feed_url}")
         try:
@@ -1091,59 +1191,100 @@ def collect() -> None:
                 continue
             if not matches_keywords(title):
                 continue
-            if is_excluded(title):
-                print(f"  除外: {title[:60]}")
-                continue
             if is_similar_title(title, existing_titles):
                 print(f"  重複スキップ: {title[:60]}")
                 continue
 
-            print(f"  処理中: {title[:60]}...")
+            rss_candidates.append({
+                "source":    source_name,
+                "url":       url,
+                "title":     title,
+                "summary":   summary,
+                "published": published,
+            })
+            existing_titles.add(title)  # 重複防止のため先に登録
 
-            paywalled = is_paywalled(url)
+    # ── RSS: フィルタ①（AI一括） ─────────────────────────────
+    filtered_rss = rss_candidates
+    if rss_candidates:
+        all_rss_titles = [c["title"] for c in rss_candidates]
+        print(f"\n[AI一括フィルタ①] RSS {len(all_rss_titles)}件をHaikuで判定中...")
+        relevant_titles = batch_filter_titles(client, all_rss_titles)
+        filtered_rss    = [c for c in rss_candidates if c["title"] in relevant_titles]
+        excluded_count  = len(rss_candidates) - len(filtered_rss)
+        for c in rss_candidates:
+            if c["title"] not in relevant_titles:
+                print(f"  [AI除外①] {c['title'][:65]}")
+        # --limit: RSSはlimit件まで
+        if limit is not None:
+            filtered_rss = filtered_rss[:limit]
+        print(f"  → {len(filtered_rss)}件が関連あり（{excluded_count}件除外）"
+              + (f"（上限 {limit} 件）" if limit is not None else ""))
+
+    # ── RSS: 第2パス（本格分析） ─────────────────────────────
+    for candidate in filtered_rss:
+        url         = candidate["url"]
+        title       = candidate["title"]
+        summary     = candidate["summary"]
+        published   = candidate["published"]
+        source_name = candidate["source"]
+
+        print(f"  処理中: {title[:60]}...")
+
+        paywalled = is_paywalled(url)
+        if paywalled:
+            print(f"  有料記事を検出 → Web検索で分析します")
+
+        try:
             if paywalled:
-                print(f"  有料記事を検出 → Web検索で分析します")
-
-            try:
-                if paywalled:
-                    analysis = analyze_with_web_search(client, title, source_name)
-                else:
-                    analysis = analyze_normal(client, title, summary, source_name)
-            except Exception as e:
-                print(f"  分析エラー: {e}")
-                time.sleep(30)
-                continue
-
-            # skip: true の場合は保存しない
-            if analysis.get("skip"):
-                reason = analysis.get("reason", "")
-                print(f"  スキップ（AI判定）: {reason}")
-                existing_urls.add(url)
-                existing_titles.add(title)
-                time.sleep(30)
-                continue
-
-            article = {
-                "url":          url,
-                "title":        title,
-                "source":       source_name,
-                "published":    published,
-                "collected_at": datetime.now().isoformat(),
-                "web_searched": paywalled,
-                "what":         analysis.get("what", ""),
-                "why":          analysis.get("why", ""),
-                "so_what":      analysis.get("so_what", ""),
-            }
-
-            new_articles.append(article)
-            existing_urls.add(url)
-            existing_titles.add(title)
-            print(f"  ✓ 追加完了{'（Web検索）' if paywalled else ''}")
+                analysis = analyze_with_web_search(client, title, source_name)
+            else:
+                analysis = analyze_normal(client, title, summary, source_name)
+        except Exception as e:
+            print(f"  分析エラー: {e}")
             time.sleep(30)
+            continue
+
+        if analysis.get("skip"):
+            reason = analysis.get("reason", "")
+            print(f"  スキップ（AI判定）: {reason}")
+            existing_urls.add(url)
+            time.sleep(30)
+            continue
+
+        article = {
+            "url":          url,
+            "title":        title,
+            "source":       source_name,
+            "published":    published,
+            "collected_at": datetime.now().isoformat(),
+            "web_searched": paywalled,
+            "what":         analysis.get("what", ""),
+            "why":          analysis.get("why", ""),
+            "so_what":      analysis.get("so_what", ""),
+        }
+
+        new_articles.append(article)
+        existing_urls.add(url)
+        print(f"  ✓ 追加完了{'（Web検索）' if paywalled else ''}")
+        time.sleep(30)
 
     # ── Gmail（日経クロストレンド） ──────────────────────────
-    print(f"\n[{NIKKEI_SOURCE}] Gmail取得中: {GMAIL_SENDER}")
-    gmail_articles = fetch_gmail_articles(client, existing_urls, existing_titles, processed_email_ids)
+    # --limit の残り枠を Gmail に引き渡す（RSS で limit 件消化済みなら 0 → スキップ）
+    gmail_limit = None
+    if limit is not None:
+        gmail_limit = max(0, limit - len(filtered_rss))
+        if gmail_limit == 0:
+            print(f"\n[{NIKKEI_SOURCE}] --limit {limit} 件に達したためスキップ")
+            gmail_articles = []
+        else:
+            print(f"\n[{NIKKEI_SOURCE}] Gmail取得中: {GMAIL_SENDER}（残り上限 {gmail_limit} 件）")
+            gmail_articles = fetch_gmail_articles(
+                client, existing_urls, existing_titles, processed_email_ids, limit=gmail_limit
+            )
+    else:
+        print(f"\n[{NIKKEI_SOURCE}] Gmail取得中: {GMAIL_SENDER}")
+        gmail_articles = fetch_gmail_articles(client, existing_urls, existing_titles, processed_email_ids)
     new_articles.extend(gmail_articles)
 
     # ── 保存 ────────────────────────────────────────────────
@@ -1159,11 +1300,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="APIを呼ばずにタイトル取得とフィルタ①のみ実行して終了",
+        help="AI一括フィルタ①のみ実行して本番分析対象タイトルを確認（Haiku API 1回分の課金あり）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="AI一括フィルタ通過後の記事を上位 N 件だけ本格分析して終了する",
     )
     args = parser.parse_args()
 
     if args.dry_run:
         dry_run()
     else:
-        collect()
+        collect(limit=args.limit)
